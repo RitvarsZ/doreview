@@ -11,6 +11,13 @@ SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 ROOT="$(dirname "$(dirname "$SELF")")"
 HOOK="$ROOT/bin/doreview-hook"
 CLEANUP_INTERVAL=600 # seconds between background merged/closed MR checks
+# Vim-ish fzf: start in "normal" mode (j/k move, q quits); "/" opens the filter, esc closes it.
+FZF_VIM_OPTS=(
+  --no-input
+  --bind 'j:down,k:up,q:abort'
+  --bind '/:show-input+unbind(j,k,q,/)'
+  --bind 'esc:transform:[[ $FZF_INPUT_STATE == enabled ]] && echo "hide-input+rebind(j,k,q,/)" || echo abort'
+)
 
 die() { echo "doreview: $*" >&2; exit 1; }
 warn() { echo "doreview: $*" >&2; }
@@ -296,8 +303,8 @@ cmd_pick() {
   printf '%s\n' "$mrs" >"$MRS_FILE"
 
   lines=$(mr_rows "$repo" <<<"$mrs")
-  picked=$(fzf --multi --ansi --delimiter=$'\t' --with-nth=3 --no-sort --reverse \
-    --header 'tab: select   enter: review selected' \
+  picked=$(fzf "${FZF_VIM_OPTS[@]}" --multi --ansi --delimiter=$'\t' --with-nth=3 --no-sort --reverse \
+    --header 'j/k: move   /: filter   tab: select   enter: review selected' \
     --preview "$(printf %q "$SELF") --mr-preview $(printf %q "$MRS_FILE") {1} $(printf %q "$(basename "$repo")")" \
     --preview-window=down,50%,wrap \
     <<<"$lines" | cut -f2) || return 0
@@ -423,8 +430,8 @@ cmd_status() {
   while :; do
     lines=$(list_reviews "$cur")
     [[ -n $lines ]] || { echo "No reviews."; return 0; }
-    out=$(fzf --ansi --delimiter=$'\t' --with-nth=2.. --no-sort --reverse \
-      --header 'enter: open review / attach   ctrl-a: attach   ctrl-x: close (again: delete)' \
+    out=$(fzf "${FZF_VIM_OPTS[@]}" --ansi --delimiter=$'\t' --with-nth=2.. --no-sort --reverse \
+      --header 'j/k: move   /: filter   enter: open review / attach   ctrl-a: attach   ctrl-x: close (again: delete)' \
       --expect=ctrl-a,ctrl-x \
       --preview "$(printf %q "$SELF") --preview {1}" --preview-window=down,60%,wrap \
       <<<"$lines") || return 0
