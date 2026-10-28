@@ -43,12 +43,16 @@ session_name() {
 
 session_alive() { tmux has-session -t "=$1" 2>/dev/null; }
 
-# Stored state, except an in-progress review whose tmux session is gone is "dead".
+# Whether session s has a window named name (exact match).
+has_window() { tmux list-windows -t "=$1" -F '#{window_name}' 2>/dev/null | grep -qxF "$2"; }
+
+# Stored state, except an in-progress review whose claude window is gone is "dead".
+# The session itself can outlive claude: nvim windows keep it (or reopen it).
 review_state() {
   local d=$1 s
   s=$(cat "$d/state" 2>/dev/null || echo unknown)
   case $s in
-    starting|running|needs-input) session_alive "$(session_name "$d")" || s=dead ;;
+    starting|running|needs-input) has_window "$(session_name "$d")" claude || s=dead ;;
   esac
   echo "$s"
 }
@@ -78,6 +82,22 @@ set_trust() {
   fi && chmod 600 "$tmp" && mv "$tmp" "$cfg" || { rm -f "$tmp"; warn "could not update $cfg"; }
 }
 
+# Whether d resolves to exactly $DATA_DIR/<repo>/<branch> and holds a state file,
+# so "..", symlinks or deeper paths can't make it point anywhere else.
+is_review_dir() {
+  local d data
+  d=$(realpath -e -- "$1" 2>/dev/null) && data=$(realpath -e -- "$DATA_DIR" 2>/dev/null) &&
+    [[ $(dirname "$(dirname "$d")") == "$data" && -f $d/state ]]
+}
+
+# rm -rf review dir d, or with sub=worktree its worktree, once is_review_dir passes.
+rm_review_dir() {
+  local d sub=${2:-}
+  is_review_dir "$1" || { warn "refusing to delete $1: not a review dir"; return 1; }
+  d=$(realpath -e -- "$1")
+  rm -rf -- "$d${sub:+/$sub}"
+}
+
 # Kill the session and remove the worktree; keep description and reviews.
 archive_review() {
   local d=$1 s repo
@@ -87,7 +107,7 @@ archive_review() {
   if [[ -e $d/worktree ]]; then
     set_trust "$d/worktree" false
     git -C "$repo" worktree remove --force "$d/worktree" 2>/dev/null || {
-      rm -rf "$d/worktree"
+      rm_review_dir "$d" worktree
       git -C "$repo" worktree prune 2>/dev/null || true
     }
   fi
@@ -98,6 +118,27 @@ attach() {
   local s; s=$(session_name "$1")
   session_alive "$s" || die "tmux session $s is not running"
   if [[ -n ${TMUX:-} ]]; then tmux switch-client -t "=$s"; else tmux attach -t "=$s"; fi
+}
+
+# Open review file r in nvim from the worktree, so file:line references resolve.
+# nvim gets its own window in the review's tmux session (reused on reopen, and the
+# session is recreated if it's gone), so more windows can be opened in the same
+# worktree. Closed reviews have no worktree left, so they use the review dir.
+open_review() {
+  local d=$1 r=$2 s name cmd cwd=$1
+  [[ -d $d/worktree ]] && cwd=$d/worktree
+  s=$(session_name "$d")
+  name=$(basename "$r" .md)
+  cmd="nvim $(printf %q "$r")"
+  if ! session_alive "$s"; then
+    tmux new-session -d -s "$s" -n "$name" -c "$cwd" "$cmd"
+  elif has_window "$s" "$name"; then
+    tmux select-window -t "=$s:=$name"
+  else
+    tmux new-window -t "=$s:" -n "$name" -c "$cwd" "$cmd"
+  fi
+  attach "$d"
+  exit 0
 }
 
 # Render a prompt template: drop or unwrap {{#rereview}}...{{/rereview}} blocks,
@@ -274,7 +315,7 @@ EOF
   echo "$branch" >"$dir/branch"
   echo "origin/$base" >"$dir/base"
   echo "$mr_iid" >"$dir/mr_iid"
-  tmux new-session -d -s "$sess" -c "$wt" "bash $(printf %q "$dir/run.sh")"
+  tmux new-session -d -s "$sess" -n claude -c "$wt" "bash $(printf %q "$dir/run.sh")"
 
   echo "Started review #$n of $branch against origin/$base (tmux session: $sess)."
   echo "Follow it with: doreview --status"
@@ -449,12 +490,7 @@ cmd_status() {
       r=$(latest_review "$d")
       case $s in
         done|closed|dead)
-          if [[ -n $r ]]; then
-            # Open from the worktree so file:line references in the review resolve;
-            # closed reviews have no worktree left, so fall back to the review dir.
-            if [[ -d $d/worktree ]]; then cd "$d/worktree"; else cd "$d"; fi
-            exec nvim "$r"
-          fi
+          [[ -n $r ]] && open_review "$d" "$r"
           attach "$d"
           ;;
         *) attach "$d" ;;
@@ -472,9 +508,10 @@ cmd_web() {
 # Close a review (kill session, remove worktree); if it is already closed, delete its files.
 cmd_close() {
   local d=${1%/}
-  [[ $d == "$DATA_DIR"/*/* && -f $d/state ]] || die "not a review: $d"
+  is_review_dir "$d" || die "not a review: $d"
   if [[ $(review_state "$d") == closed ]]; then
-    rm -rf "$d"
+    session_alive "$(session_name "$d")" && tmux kill-session -t "=$(session_name "$d")"
+    rm_review_dir "$d"
   else
     archive_review "$d"
   fi
