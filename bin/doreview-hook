@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# doreview-hook <state> <review-dir>: Claude Code hook that records a review's
+# state and sends a desktop notification when it finishes or needs input.
+state=$1 dir=$2
+cat >/dev/null # drain the hook's JSON input
+[[ -d $dir ]] || exit 0
+[[ $(cat "$dir/state" 2>/dev/null) == "$state" ]] && exit 0
+printf '%s\n' "$state" >"$dir/state"
+case $state in
+  done|needs-input)
+    command -v notify-send >/dev/null &&
+      notify-send -a doreview "doreview: $(cat "$dir/branch" 2>/dev/null) $state" >/dev/null 2>&1
+    ;;
+esac
+exit 0

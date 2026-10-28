@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# doreview: run Claude code reviews of GitLab MR branches in parallel git worktrees.
+# See plan.md for the design.
+set -euo pipefail
+shopt -s nullglob
+shopt -u patsub_replacement 2>/dev/null || true
+
+DATA_DIR="${DOREVIEW_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/doreview}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/doreview"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(dirname "$(dirname "$SELF")")"
+HOOK="$ROOT/bin/doreview-hook"
+CLEANUP_INTERVAL=600 # seconds between background merged/closed MR checks
+
+die() { echo "doreview: $*" >&2; exit 1; }
+warn() { echo "doreview: $*" >&2; }
+
+usage() {
+  cat <<EOF
+Usage:
+  doreview [<branch>] [--base <branch>] [--effort low|medium|high|xhigh|max]
+  doreview --status
+
+Without a branch, pick one or more open MRs with fzf (tab to multi-select).
+
+Reviews live in $DATA_DIR
+EOF
+}
+
+# --- review directory helpers -------------------------------------------------
+
+session_name() {
+  local d=$1
+  printf 'doreview-%s-%s' "$(basename "$(dirname "$d")")" "$(basename "$d")" | tr '.:' '__'
+}
+
+session_alive() { tmux has-session -t "=$1" 2>/dev/null; }
+
+# Stored state, except an in-progress review whose tmux session is gone is "dead".
+review_state() {
+  local d=$1 s
+  s=$(cat "$d/state" 2>/dev/null || echo unknown)
+  case $s in
+    starting|running|needs-input) session_alive "$(session_name "$d")" || s=dead ;;
+  esac
+  echo "$s"
+}
+
+# Highest-numbered review file that exists, or nothing.
+latest_review() {
+  local d=$1 n
+  n=$(cat "$d/n" 2>/dev/null || echo 0)
+  for ((; n > 0; n--)); do
+    [[ -f $d/review-$n.md ]] && { echo "$d/review-$n.md"; return; }
+  done
+  return 0
+}
+
+# Mark a worktree as trusted in Claude Code (true), or drop its entry (false), so
+# the review session doesn't stop at the workspace trust dialog. Trust lookup
+# doesn't walk past a git root, so each worktree needs its own entry.
+set_trust() {
+  local wt cfg="$HOME/.claude.json" tmp
+  wt=$(realpath -m "$1")
+  [[ -f $cfg ]] || echo '{}' >"$cfg"
+  tmp=$(mktemp "$cfg.doreview.XXXXXX")
+  if [[ $2 == true ]]; then
+    jq --arg p "$wt" '.projects[$p] = ((.projects[$p] // {}) + {hasTrustDialogAccepted: true})' "$cfg" >"$tmp"
+  else
+    jq --arg p "$wt" 'del(.projects[$p])' "$cfg" >"$tmp"
+  fi && chmod 600 "$tmp" && mv "$tmp" "$cfg" || { rm -f "$tmp"; warn "could not update $cfg"; }
+}
+
+# Kill the session and remove the worktree; keep description and reviews.
+archive_review() {
+  local d=$1 s repo
+  s=$(session_name "$d")
+  session_alive "$s" && tmux kill-session -t "=$s"
+  repo=$(cat "$d/repo" 2>/dev/null || true)
+  if [[ -e $d/worktree ]]; then
+    set_trust "$d/worktree" false
+    git -C "$repo" worktree remove --force "$d/worktree" 2>/dev/null || {
+      rm -rf "$d/worktree"
+      git -C "$repo" worktree prune 2>/dev/null || true
+    }
+  fi
+  echo closed >"$d/state"
+}
+
+attach() {
+  local s; s=$(session_name "$1")
+  session_alive "$s" || die "tmux session $s is not running"
+  if [[ -n ${TMUX:-} ]]; then tmux switch-client -t "=$s"; else tmux attach -t "=$s"; fi
+}
+
+# Render a prompt template: drop or unwrap {{#rereview}}...{{/rereview}} blocks,
+# then substitute {{key}} for each key=value argument.
+render() {
+  local tpl rereview=$2 kv
+  tpl=$(<"$1")
+  shift 2
+  if [[ -n $rereview ]]; then
+    tpl=$(sed -e '/{{#rereview}}/d' -e '/{{\/rereview}}/d' <<<"$tpl")
+  else
+    tpl=$(sed -e '/{{#rereview}}/,/{{\/rereview}}/d' <<<"$tpl")
+  fi
+  for kv in "$@"; do
+    tpl=${tpl//"{{${kv%%=*}}}"/"${kv#*=}"}
+  done
+  printf '%s\n' "$tpl"
+}
+
+# --- doreview <branch> --------------------------------------------------------
+
+cmd_review() {
+  local branch="" base="" effort=high
+  while (($#)); do
+    case $1 in
+      --base) base=${2:?--base needs a branch}; shift 2 ;;
+      --effort) effort=${2:?--effort needs a level}; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown option: $1" ;;
+      *) [[ -z $branch ]] || die "unexpected argument: $1"; branch=$1; shift ;;
+    esac
+  done
+  case $effort in low|medium|high|xhigh|max) ;; *) die "invalid effort: $effort" ;; esac
+  if [[ -z $branch ]]; then
+    [[ -z $base ]] || die "--base can't be used with the MR picker (each MR has its own target)"
+    cmd_pick "$effort"
+    return
+  fi
+
+  local common repo dir sess
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || die "not inside a git repository"
+  repo=$(dirname "$common")
+  dir="$DATA_DIR/$(basename "$repo")/${branch//\//__}"
+  sess=$(session_name "$dir")
+
+  local fresh=1
+  if [[ -d $dir ]]; then
+    fresh=0
+    case $(review_state "$dir") in
+      starting|running|needs-input) die "review of $branch is still in progress (see doreview --status)" ;;
+    esac
+  fi
+
+  if [[ -z ${FETCHED:-} ]]; then
+    echo "Fetching origin..."
+    git -C "$repo" fetch --quiet --prune origin || die "git fetch failed"
+  fi
+  local head
+  head=$(git -C "$repo" rev-parse --verify -q "origin/$branch^{commit}") || die "branch origin/$branch not found"
+
+  local mr mr_iid="" mr_url="" mr_desc=""
+  if mr=$(cd "$repo" && glab mr view "$branch" -F json 2>/dev/null); then
+    mr_iid=$(jq -r '.iid // ""' <<<"$mr")
+    mr_url=$(jq -r '.web_url // ""' <<<"$mr")
+    mr_desc=$(jq -r '.description // ""' <<<"$mr")
+    [[ -n $base ]] || base=$(jq -r '.target_branch // ""' <<<"$mr")
+  else
+    warn "no MR found for $branch, falling back to the default base"
+  fi
+  if [[ -z $base ]]; then
+    base=$(git -C "$repo" symbolic-ref --short -q refs/remotes/origin/HEAD || true)
+    if [[ -z $base ]]; then
+      local b
+      for b in develop main master; do
+        git -C "$repo" rev-parse --verify -q "origin/$b" >/dev/null && { base=$b; break; }
+      done
+    fi
+    [[ -n $base ]] || die "could not determine the base branch, pass --base"
+  fi
+  base=${base#origin/}
+  local merge_base
+  merge_base=$(git -C "$repo" merge-base "origin/$base" "$head") || die "no merge-base between origin/$base and origin/$branch"
+
+  # Description: pre-filled from the MR on first review, reused on re-reviews.
+  mkdir -p "$dir"
+  local desc="$dir/description.md" before
+  [[ -f $desc ]] || printf '%s\n' "$mr_desc" >"$desc"
+  before=$(stat -c %y "$desc")
+  nvim "$desc"
+  if [[ $(stat -c %y "$desc") == "$before" ]]; then
+    ((fresh)) && rm -rf "$dir"
+    echo "Aborted (description not saved)."
+    exit 0
+  fi
+
+  local wt="$dir/worktree"
+  if [[ -e $wt/.git ]]; then
+    git -C "$wt" checkout --quiet --force --detach "$head"
+    git -C "$wt" clean --quiet -fd
+  else
+    git -C "$repo" worktree prune
+    git -C "$repo" worktree add --quiet --detach "$wt" "$head"
+  fi
+  set_trust "$wt" true
+
+  local prev_n n since_sha prev_review rereview=""
+  prev_n=$(cat "$dir/n" 2>/dev/null || echo 0)
+  n=$((prev_n + 1))
+  since_sha=$(cat "$dir/last_sha" 2>/dev/null || true)
+  prev_review=$(latest_review "$dir")
+  if [[ -n $prev_review && -n $since_sha ]]; then
+    rereview=1
+    [[ $since_sha == "$head" ]] && warn "no new commits since the last review"
+  fi
+
+  local tpl="$CONFIG_DIR/prompt.md"
+  if [[ -f $repo/.doreview/prompt.md ]]; then
+    tpl=$repo/.doreview/prompt.md
+  elif [[ ! -f $tpl ]]; then
+    mkdir -p "$CONFIG_DIR"
+    cp "$ROOT/share/prompt.md" "$tpl"
+    echo "Created default prompt template at $tpl"
+  fi
+
+  local out="$dir/review-$n.md" prompt="$dir/prompt-$n.md"
+  render "$tpl" "$rereview" \
+    "branch=$branch" \
+    "head_sha=$head" \
+    "base=origin/$base" \
+    "merge_base=$merge_base" \
+    "diff_cmd=git diff $merge_base..$head" \
+    "mr_url=${mr_url:-(no MR)}" \
+    "description_path=$desc" \
+    "effort=$effort" \
+    "output_path=$out" \
+    "previous_review=$prev_review" \
+    "since_sha=$since_sha" \
+    "since_cmd=git diff $since_sha..$head" \
+    >"$prompt"
+
+  # Per-review settings: read-only allowlist plus the hooks that track state.
+  jq -n --arg hook "$HOOK" --arg dir "$dir" --arg out "$out" '
+    def cmd(state): [{type: "command", command: "\($hook | @sh) \(state) \($dir | @sh)"}];
+    {
+      permissions: {
+        allow: [
+          "Read(/\($dir)/**)", "Agent", "Skill(code-review)",
+          "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git blame:*)",
+          "Bash(git merge-base:*)", "Bash(git rev-parse:*)", "Bash(git status:*)", "Bash(git ls-files:*)",
+          "Write(/\($out))", "Edit(/\($out))"
+        ]
+      },
+      hooks: {
+        UserPromptSubmit: [{hooks: cmd("running")}],
+        PostToolUse: [{hooks: cmd("running")}],
+        Notification: [{matcher: "permission_prompt|elicitation_dialog", hooks: cmd("needs-input")}],
+        Stop: [{hooks: cmd("done")}]
+      }
+    }' >"$dir/settings.json"
+
+  # --setting-sources user: never load .claude/ settings (hooks!) from the branch under review.
+  cat >"$dir/run.sh" <<EOF
+#!/usr/bin/env bash
+cd $(printf %q "$wt") || exit 1
+exec claude --setting-sources user --settings $(printf %q "$dir/settings.json") \\
+  --add-dir $(printf %q "$dir") -n $(printf %q "doreview $branch #$n") "\$(cat $(printf %q "$prompt"))"
+EOF
+
+  session_alive "$sess" && tmux kill-session -t "=$sess"
+  echo starting >"$dir/state"
+  echo "$n" >"$dir/n"
+  echo "$head" >"$dir/last_sha"
+  echo "$repo" >"$dir/repo"
+  echo "$branch" >"$dir/branch"
+  echo "origin/$base" >"$dir/base"
+  echo "$mr_iid" >"$dir/mr_iid"
+  tmux new-session -d -s "$sess" -c "$wt" "bash $(printf %q "$dir/run.sh")"
+
+  echo "Started review #$n of $branch against origin/$base (tmux session: $sess)."
+  echo "Follow it with: doreview --status"
+}
+
+# --- doreview (no branch): MR picker ------------------------------------------
+
+cmd_pick() {
+  local effort=$1 common repo mrs me lines picked
+  command -v fzf >/dev/null || die "fzf not found"
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || die "not inside a git repository"
+  repo=$(dirname "$common")
+
+  echo "Fetching origin..."
+  git -C "$repo" fetch --quiet --prune origin || die "git fetch failed"
+  FETCHED=1
+
+  echo "Listing open MRs..."
+  mrs=$(cd "$repo" && glab mr list --not-draft --per-page 100 -F json) || die "glab mr list failed"
+  me=$(cd "$repo" && glab api user 2>/dev/null | jq -r '.username // ""') || me=""
+  mrs=$(jq --arg me "$me" '[.[] | select((.draft | not) and .author.username != $me)]' <<<"$mrs")
+  [[ $(jq length <<<"$mrs") -gt 0 ]] || { echo "No open MRs."; return 0; }
+
+  MRS_FILE=$(mktemp -t doreview-mrs.XXXXXX)
+  trap 'rm -f "$MRS_FILE"' EXIT
+  printf '%s\n' "$mrs" >"$MRS_FILE"
+
+  lines=$(mr_rows "$repo" <<<"$mrs")
+  picked=$(fzf --multi --ansi --delimiter=$'\t' --with-nth=3 --no-sort --reverse \
+    --header 'tab: select   enter: review selected' \
+    --preview "$(printf %q "$SELF") --mr-preview $(printf %q "$MRS_FILE") {1} $(printf %q "$(basename "$repo")")" \
+    --preview-window=down,50%,wrap \
+    <<<"$lines" | cut -f2) || return 0
+
+  local b
+  # Branches come in on fd 3 so each review keeps the terminal as stdin for nvim.
+  while IFS= read -r -u 3 b; do
+    [[ -n $b ]] || continue
+    echo "== $b"
+    (cmd_review "$b" --effort "$effort") || warn "skipped $b"
+  done 3<<<"$picked"
+}
+
+# One line per MR: <iid>\t<branch>\t<display>, with a doreview marker when reviewed.
+mr_rows() {
+  local repo=$1 iid branch title author sha d n last count marker
+  jq -r '.[] | [.iid, .source_branch, .title, .author.username, .sha] | @tsv' |
+    while IFS=$'\t' read -r iid branch title author sha; do
+      d="$DATA_DIR/$(basename "$repo")/${branch//\//__}"
+      marker=""
+      if [[ -f $d/n ]]; then
+        n=$(<"$d/n")
+        last=$(cat "$d/last_sha" 2>/dev/null || true)
+        if [[ $last == "$sha" ]]; then
+          marker="\e[32m✓ reviewed #$n\e[0m"
+        elif count=$(git -C "$repo" rev-list --count "$last..$sha" 2>/dev/null); then
+          marker="\e[33m✓ reviewed #$n · $count new commits\e[0m"
+        else
+          marker="\e[33m✓ reviewed #$n · branch changed\e[0m"
+        fi
+      fi
+      printf '%s\t%s\t!%-5s %-40s %-50s @%-15s %b\n' \
+        "$iid" "$branch" "$iid" "$branch" "${title:0:50}" "$author" "$marker"
+    done
+}
+
+cmd_mr_preview() {
+  local file=$1 iid=$2 repo_name=$3 branch r
+  jq -r --argjson iid "$iid" '.[] | select(.iid == $iid) |
+    "!\(.iid) \(.title)\n@\(.author.username)  \(.source_branch) → \(.target_branch)\n\n\(.description // "")"' "$file"
+  branch=$(jq -r --argjson iid "$iid" '.[] | select(.iid == $iid) | .source_branch' "$file")
+  r=$(latest_review "$DATA_DIR/$repo_name/${branch//\//__}")
+  if [[ -n $r ]]; then
+    printf '\n──── %s ────\n' "$(basename "$r")"
+    head -40 "$r"
+  fi
+}
+
+# --- doreview --status --------------------------------------------------------
+
+fmt_age() {
+  local s=$1
+  if ((s < 60)); then echo "${s}s ago"
+  elif ((s < 3600)); then echo "$((s / 60))m ago"
+  elif ((s < 86400)); then echo "$((s / 3600))h ago"
+  else echo "$((s / 86400))d ago"
+  fi
+}
+
+state_color() {
+  case $1 in
+    done) echo 32 ;; running|starting) echo 33 ;; needs-input) echo 31 ;; *) echo 90 ;;
+  esac
+}
+
+# One tab-separated line per review: <dir>\t<display>, current repo first, newest first.
+list_reviews() {
+  local cur=$1 now d s repo mtime
+  now=$(date +%s)
+  for d in "$DATA_DIR"/*/*/; do
+    d=${d%/}
+    [[ -f $d/state ]] || continue
+    s=$(review_state "$d")
+    repo=$(cat "$d/repo" 2>/dev/null || true)
+    mtime=$(stat -c %Y "$d/state")
+    printf '%d\t%d\t%s\t\e[%sm●\e[0m %-12s %-20s %-40s #%-3s %s\n' \
+      "$([[ $repo == "$cur" ]] && echo 0 || echo 1)" "$mtime" "$d" \
+      "$(state_color "$s")" "$s" "$(basename "$repo")" "$(cat "$d/branch")" "$(cat "$d/n")" \
+      "$(fmt_age $((now - mtime)))"
+  done | sort -t$'\t' -k1,1n -k2,2nr | cut -f3-
+}
+
+cmd_preview() {
+  local d=$1 r
+  printf 'branch: %s\nbase:   %s\nstate:  %s\n' "$(cat "$d/branch")" "$(cat "$d/base" 2>/dev/null)" "$(review_state "$d")"
+  r=$(latest_review "$d")
+  if [[ -n $r ]]; then
+    printf '\n'
+    cat "$r"
+  else
+    printf '\n(no review written yet)\n'
+  fi
+}
+
+maybe_cleanup() {
+  local stamp="$DATA_DIR/.last-cleanup"
+  [[ -f $stamp ]] && (($(date +%s) - $(stat -c %Y "$stamp") < CLEANUP_INTERVAL)) && return 0
+  mkdir -p "$DATA_DIR"
+  touch "$stamp"
+  ("$SELF" --cleanup >/dev/null 2>&1 &)
+}
+
+# Archive finished reviews whose MR has been merged or closed.
+cmd_cleanup() {
+  local d iid repo st
+  for d in "$DATA_DIR"/*/*/; do
+    d=${d%/}
+    case $(review_state "$d") in done|dead) ;; *) continue ;; esac
+    iid=$(cat "$d/mr_iid" 2>/dev/null || true)
+    repo=$(cat "$d/repo" 2>/dev/null || true)
+    [[ -n $iid && -d $repo ]] || continue
+    st=$(cd "$repo" && glab mr view "$iid" -F json 2>/dev/null | jq -r '.state') || continue
+    [[ $st == merged || $st == closed ]] && archive_review "$d"
+  done
+  return 0
+}
+
+cmd_status() {
+  command -v fzf >/dev/null || die "fzf not found"
+  maybe_cleanup
+  local cur="" lines out key d s r answer
+  cur=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && cur=$(dirname "$cur") || cur=""
+  while :; do
+    lines=$(list_reviews "$cur")
+    [[ -n $lines ]] || { echo "No reviews."; return 0; }
+    out=$(fzf --ansi --delimiter=$'\t' --with-nth=2.. --no-sort --reverse \
+      --header 'enter: open review / attach   ctrl-a: attach   ctrl-x: close (again: delete)' \
+      --expect=ctrl-a,ctrl-x \
+      --preview "$(printf %q "$SELF") --preview {1}" --preview-window=down,60%,wrap \
+      <<<"$lines") || return 0
+    key=$(sed -n 1p <<<"$out")
+    d=$(sed -n 2p <<<"$out" | cut -f1)
+    [[ -n $d ]] || return 0
+    s=$(review_state "$d")
+    case $key in
+      ctrl-a) attach "$d" ;;
+      ctrl-x)
+        if [[ $s == closed ]]; then
+          read -rp "Delete all files of $(cat "$d/branch") review? [y/N] " answer </dev/tty
+          [[ $answer == [yY] ]] && rm -rf "$d"
+        else
+          read -rp "Close $(cat "$d/branch") review (kill session, remove worktree)? [y/N] " answer </dev/tty
+          [[ $answer == [yY] ]] && archive_review "$d"
+        fi
+        continue
+        ;;
+      *)
+        r=$(latest_review "$d")
+        case $s in
+          done|closed|dead)
+            if [[ -n $r ]]; then
+              # Open from the worktree so file:line references in the review resolve;
+              # closed reviews have no worktree left, so fall back to the review dir.
+              if [[ -d $d/worktree ]]; then cd "$d/worktree"; else cd "$d"; fi
+              exec nvim "$r"
+            fi
+            attach "$d"
+            ;;
+          *) attach "$d" ;;
+        esac
+        ;;
+    esac
+    return 0
+  done
+}
+
+case ${1:-} in
+  -h | --help) usage ;;
+  --status) cmd_status ;;
+  --preview) cmd_preview "$2" ;;
+  --cleanup) cmd_cleanup ;;
+  --mr-preview) cmd_mr_preview "$2" "$3" "$4" ;;
+  *) cmd_review "$@" ;;
+esac
