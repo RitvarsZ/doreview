@@ -425,51 +425,51 @@ cmd_cleanup() {
 cmd_status() {
   command -v fzf >/dev/null || die "fzf not found"
   maybe_cleanup
-  local cur="" lines out key d s r answer
+  local cur="" lines out key d s r list
   cur=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && cur=$(dirname "$cur") || cur=""
-  while :; do
-    lines=$(list_reviews "$cur")
-    [[ -n $lines ]] || { echo "No reviews."; return 0; }
-    out=$(fzf "${FZF_VIM_OPTS[@]}" --ansi --delimiter=$'\t' --with-nth=2.. --no-sort --reverse \
-      --header 'j/k: move   /: filter   enter: open review / attach   ctrl-a: attach   ctrl-x: close (again: delete)   ctrl-r: refresh' \
-      --bind "ctrl-r:reload($(printf %q "$SELF") --list-reviews $(printf %q "$cur"))+refresh-preview" \
-      --expect=ctrl-a,ctrl-x \
-      --preview "$(printf %q "$SELF") --preview {1}" --preview-window=down,60%,wrap \
-      <<<"$lines") || return 0
-    key=$(sed -n 1p <<<"$out")
-    d=$(sed -n 2p <<<"$out" | cut -f1)
-    [[ -n $d ]] || return 0
-    s=$(review_state "$d")
-    case $key in
-      ctrl-a) attach "$d" ;;
-      ctrl-x)
-        if [[ $s == closed ]]; then
-          read -rp "Delete all files of $(cat "$d/branch") review? [y/N] " answer </dev/tty
-          [[ $answer == [yY] ]] && rm -rf "$d"
-        else
-          read -rp "Close $(cat "$d/branch") review (kill session, remove worktree)? [y/N] " answer </dev/tty
-          [[ $answer == [yY] ]] && archive_review "$d"
-        fi
-        continue
-        ;;
-      *)
-        r=$(latest_review "$d")
-        case $s in
-          done|closed|dead)
-            if [[ -n $r ]]; then
-              # Open from the worktree so file:line references in the review resolve;
-              # closed reviews have no worktree left, so fall back to the review dir.
-              if [[ -d $d/worktree ]]; then cd "$d/worktree"; else cd "$d"; fi
-              exec nvim "$r"
-            fi
-            attach "$d"
-            ;;
-          *) attach "$d" ;;
-        esac
-        ;;
-    esac
-    return 0
-  done
+  lines=$(list_reviews "$cur")
+  [[ -n $lines ]] || { echo "No reviews."; return 0; }
+  list="$(printf %q "$SELF") --list-reviews $(printf %q "$cur")"
+  out=$(fzf "${FZF_VIM_OPTS[@]}" --ansi --delimiter=$'\t' --with-nth=2.. --no-sort --reverse \
+    --header 'j/k: move   /: filter   enter: open review / attach   ctrl-a: attach   ctrl-x: close (again: delete)   ctrl-r: refresh' \
+    --bind "ctrl-r:reload($list)+refresh-preview" \
+    --bind "ctrl-x:execute-silent($(printf %q "$SELF") --close {1})+reload($list)+refresh-preview" \
+    --expect=ctrl-a \
+    --preview "$(printf %q "$SELF") --preview {1}" --preview-window=down,60%,wrap \
+    <<<"$lines") || return 0
+  key=$(sed -n 1p <<<"$out")
+  d=$(sed -n 2p <<<"$out" | cut -f1)
+  [[ -n $d ]] || return 0
+  s=$(review_state "$d")
+  case $key in
+    ctrl-a) attach "$d" ;;
+    *)
+      r=$(latest_review "$d")
+      case $s in
+        done|closed|dead)
+          if [[ -n $r ]]; then
+            # Open from the worktree so file:line references in the review resolve;
+            # closed reviews have no worktree left, so fall back to the review dir.
+            if [[ -d $d/worktree ]]; then cd "$d/worktree"; else cd "$d"; fi
+            exec nvim "$r"
+          fi
+          attach "$d"
+          ;;
+        *) attach "$d" ;;
+      esac
+      ;;
+  esac
+}
+
+# Close a review (kill session, remove worktree); if it is already closed, delete its files.
+cmd_close() {
+  local d=${1%/}
+  [[ $d == "$DATA_DIR"/*/* && -f $d/state ]] || die "not a review: $d"
+  if [[ $(review_state "$d") == closed ]]; then
+    rm -rf "$d"
+  else
+    archive_review "$d"
+  fi
 }
 
 case ${1:-} in
@@ -479,5 +479,6 @@ case ${1:-} in
   --cleanup) cmd_cleanup ;;
   --mr-preview) cmd_mr_preview "$2" "$3" "$4" ;;
   --list-reviews) list_reviews "${2:-}" ;;
+  --close) cmd_close "$2" ;;
   *) cmd_review "$@" ;;
 esac
