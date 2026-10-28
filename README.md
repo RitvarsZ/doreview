@@ -1,6 +1,6 @@
 # doreview
 
-Runs Claude code reviews of GitLab MRs in parallel git worktrees + tmux. See `plan.md`.
+Runs Claude code reviews of GitLab MRs in parallel git worktrees + tmux.
 
 ## Setup
 
