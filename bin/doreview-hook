@@ -4,6 +4,9 @@
 state=$1 dir=$2
 cat >/dev/null # drain the hook's JSON input
 [[ -d $dir ]] || exit 0
+# Stop also fires when Claude ends its turn to wait for background agents, so
+# it only means done once this run's review file has been written.
+[[ $state == done && ! -s $dir/review-$(cat "$dir/n" 2>/dev/null).md ]] && state=running
 [[ $(cat "$dir/state" 2>/dev/null) == "$state" ]] && exit 0
 printf '%s\n' "$state" >"$dir/state"
 case $state in
